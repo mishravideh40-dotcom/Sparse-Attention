@@ -219,15 +219,58 @@ versus the as-built dense matrix (2.09 MB and 4.11 MB respectively vs.
 268.44 MB) — the entire point of sparse attention, visible even though this
 repo's current implementations don't yet realize it.
 
-## 5. Scope of this submission
+## 5. Quality eval: char-GPT on TinyShakespeare
+
+`sparse_attention/char_gpt.py` is a minimal 2-layer, single-head-per-layer
+char-level GPT (embed dim 64, `nn.LayerNorm` + residual + 4x MLP per block)
+that plugs `dense_attention` directly in as its attention mechanism —
+single-head, not multi-head, because the question here is "does this
+sparsity pattern hurt modeling quality," which doesn't need extra heads to
+answer. `scripts/quality_eval.py` trains three otherwise-identical models
+(same init seed, same batch order, same 500 AdamW steps, block_size=128) —
+one per attention kind — on TinyShakespeare (1.1MB, downloaded via
+`scripts/download_data.py`, 90/10 train/val char split), and plots
+validation loss. Sparse settings: `window_size=16` (so local context is
+~12.5% of the 128-token block — meaningfully sparse, not window≈block_size,
+which would just degenerate back to dense per section 1), `num_global=4`,
+`num_random=8` for BigBird.
+
+Final validation loss (500 steps): **dense 2.0810, sliding-window 2.0307,
+BigBird 2.0441** — both sparse variants outperformed dense, with
+sliding-window lowest. `quality_eval_results/loss.png` shows sliding-window
+pulling ahead of dense by roughly step 75 and staying ahead for the rest of
+training; BigBird tracks close behind it.
+
+This is a genuinely interesting result, not the one section 3 might predict
+in isolation, and it's worth being honest about rather than cherry-picking
+an explanation: at this *scale* (2 layers, embed dim 64, 500 steps, a
+1MB dataset), a restricted attention pattern is acting as a form of
+inductive bias / implicit regularization rather than an information
+bottleneck. Character-level Shakespeare is dominated by short-range
+structure — spelling, common bigrams/trigrams, word boundaries, line
+rhythm — so a 16-token window already contains most of what predicts the
+next character most of the time, and the model doesn't have to spend its
+very limited capacity (single head, 64-dim) learning to *ignore* the 87.5%
+of the window sliding-window already excludes by construction. Dense
+attention has to learn that suppression itself, which is extra work for a
+tiny model in a 500-step budget. This doesn't contradict section 3's
+example — full attention still strictly dominates in expressive power (it
+*can* recover anything sliding-window can, plus long-range dependencies
+sliding-window structurally cannot) — it just shows that "more expressive"
+and "easier to optimize well at small scale, in few steps" are different
+axes. The gap would be expected to narrow or reverse with more capacity,
+more steps, or a task with real long-range dependencies (e.g. needing to
+recall a character name introduced many lines earlier) — which is exactly
+the kind of task section 3's worked example is designed to isolate.
+
+## 6. Scope of this submission
 
 Implemented and tested: manual dense attention, sliding-window sparse
 attention, BigBird-style local+global+random sparse attention, NaN-safe
-softmax, and the wall-clock/memory benchmark above — with a correctness
-harness covering items 1-4 (checklist items 1, 2, 3, 4, and 5).
-
-Not implemented in this submission, due to time constraints: the char-GPT
-quality eval on TinyShakespeare comparing dense vs. sparse loss (item 6).
+softmax, the wall-clock/memory benchmark, and the char-GPT quality eval —
+covering every item in the Task 1 checklist (1 through 6), each backed by
+either a passing test suite (items 1-4) or a runnable script with saved,
+inspectable output (items 5-6).
 
 The depth-over-completeness note in the task brief is why sections 1-3
 here go into the actual mechanism and worked numeric examples rather than

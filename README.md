@@ -32,6 +32,12 @@ pip install -r requirements.txt
 - `scripts/benchmark.py` — wall-clock + memory benchmark across
   seq_len 512→8192 for all three attention variants; writes
   `benchmark_results/{results.csv,time.png,memory.png}`.
+- `sparse_attention/char_gpt.py` + `scripts/quality_eval.py` — tiny 2-layer
+  char-level GPT trained on TinyShakespeare with each attention variant as
+  a drop-in swap; writes `quality_eval_results/{results.csv,loss.png}`.
+- `scripts/download_data.py` — fetches TinyShakespeare into
+  `data/tinyshakespeare.txt` (gitignored; run this first for the quality
+  eval).
 
 Run the tests:
 
@@ -51,20 +57,26 @@ Run the benchmark:
 python scripts/benchmark.py
 ```
 
+Run the quality eval (downloads TinyShakespeare first, ~1MB):
+
+```
+python scripts/download_data.py
+python scripts/quality_eval.py
+```
+
 ## Status
 
-Implemented and tested: manual dense attention, sliding-window sparse
-attention, BigBird-style local+global+random sparse attention, NaN-safe
-softmax, and the wall-clock/memory benchmark — with a correctness harness
-covering items 1-4 (checklist items 1, 2, 3, 4, and 5).
+All six Task 1 checklist items implemented: manual dense attention,
+sliding-window sparse attention, BigBird-style local+global+random sparse
+attention, NaN-safe softmax, a wall-clock/memory benchmark (seq_len
+512→8192), and a char-GPT quality eval on TinyShakespeare — with a 23-test
+correctness harness for items 1-4 and saved, inspectable output
+(CSV + plots) for items 5-6.
 
-Not implemented (time-boxed submission): the char-GPT quality eval on
-TinyShakespeare comparing dense vs. sparse loss (item 6). See `WRITEUP.md`
-section 5.
-
-See `WRITEUP.md` for the full explanation of dense attention, both sparse
+See `WRITEUP.md` for the full explanation: dense attention, both sparse
 patterns, the NaN fix, why sliding-window attention loses information that
-BigBird's global tokens recover, and the benchmark findings (including why
-wall-clock time doesn't yet improve, and why memory would with a proper
-sparse kernel) — with real numbers from `examples/walkthrough.py` and
-`benchmark_results/`.
+BigBird's global tokens recover, the benchmark findings (why wall-clock
+time doesn't yet improve and why memory would with a proper sparse kernel),
+and the quality-eval result — sparse attention actually *matched or beat*
+dense at this small scale, and why that's a real, explainable finding
+rather than a contradiction of section 3's example.
