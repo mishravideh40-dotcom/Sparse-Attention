@@ -9,8 +9,19 @@ def manual_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     # to inf, but shifting every value down by the row max keeps everything
     # <= 0 before exp(), so the result is identical while staying finite.
     x_max = x.max(dim=dim, keepdim=True).values
+
+    # A fully-masked row (every score == -inf) has x_max == -inf, so
+    # x - x_max becomes -inf - (-inf) = nan for every entry in that row.
+    # Swap the max to 0 for those rows only: x - 0 stays -inf, exp(-inf) = 0,
+    # so the row's weights come out all-zero instead of nan.
+    fully_masked = torch.isneginf(x_max)
+    x_max = torch.where(fully_masked, torch.zeros_like(x_max), x_max)
+
     x_exp = torch.exp(x - x_max)
-    return x_exp / x_exp.sum(dim=dim, keepdim=True)
+    denom = x_exp.sum(dim=dim, keepdim=True)
+    # denom is 0 exactly on fully-masked rows (every exp(-inf) == 0); avoid 0/0.
+    safe_denom = torch.where(denom == 0, torch.ones_like(denom), denom)
+    return x_exp / safe_denom
 
 
 def causal_mask(seq_len: int) -> torch.Tensor:
