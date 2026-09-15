@@ -1,21 +1,28 @@
-"""Wall-clock + memory benchmark: dense vs. sliding-window (reference and
-fast) vs. BigBird-style attention across sequence length.
+"""Wall-clock + memory benchmark: dense vs. sliding-window vs. BigBird-style
+attention across sequence length -- reference (masked dense_attention) and
+real fast-kernel implementations for both sparse patterns.
 
 Honesty note (see WRITEUP.md section 4): dense, sliding_window (reference),
-and bigbird are all *correctness references* built on top of
-`dense_attention` -- they always materialize a full (seq_len, seq_len)
-score/weight matrix and only differ in which entries the mask zeroes out.
-So their wall-clock and memory numbers are expected to be the same as
-dense's, not better -- masking is extra work on top of the full matmul, not
-a discount. sliding_window_fast is different: it's a real gather-based
-kernel (sparse_attention/sliding_window.py) that never computes or
-allocates the parts of the score matrix outside a query's window, so it's
-the one variant here that should show an actual, measured speedup and
-memory reduction rather than only the theoretical one computed from mask
-density. BigBird doesn't get an equivalent fast kernel in this repo -- its
-random component doesn't have sliding-window's fixed-offset structure, so
-a real gather/block-sparse kernel for it is a materially harder unfold
-problem; that's called out as future work rather than attempted here.
+and bigbird (reference) are all built on `dense_attention` -- they always
+materialize a full (seq_len, seq_len) score/weight matrix and only differ
+in which entries the mask zeroes out, so their time/memory numbers are
+expected to match dense's, not beat it.
+
+sliding_window_fast and bigbird_fast are real kernels that skip computing
+masked-out entries instead of computing-then-discarding them, but they get
+there very differently, and the benchmark is set up to show that
+difference, not paper over it:
+- sliding_window_fast gathers each query's window via `Tensor.unfold`,
+  which is a zero-copy *view* (overlapping strides into the same storage
+  as the padded K/V) -- there's no extra memory allocation proportional to
+  window_size * head_dim, only the final (seq_len, window_size) weights.
+- bigbird_fast's local+global+random key set isn't a fixed contiguous
+  offset, so it can't be unfolded -- it's gathered with fancy indexing
+  (`k[:, indices, :]`), which *does* materialize a real copy shaped
+  (seq_len, K, head_dim). That copy is the dominant cost, and is reported
+  separately from the weights-only number so the comparison with
+  sliding_window_fast is apples-to-apples on the metric they share, not
+  just the metric that happens to flatter the faster kernel.
 """
 import csv
 import time
@@ -27,7 +34,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 
-from sparse_attention.bigbird import bigbird_mask
+from sparse_attention.bigbird import bigbird_attention_fast, bigbird_mask
 from sparse_attention.dense_attention import causal_mask, dense_attention
 from sparse_attention.sliding_window import sliding_window_attention_fast, sliding_window_mask
 
@@ -35,6 +42,8 @@ SEQ_LENS = [512, 1024, 2048, 4096, 8192]
 HEAD_DIM = 64
 BATCH = 1
 WINDOW_SIZE = 64
+NUM_GLOBAL = 32
+NUM_RANDOM = 32
 N_REPS = 5
 BYTES_PER_ELEM = 4  # float32
 OUT_DIR = Path(__file__).resolve().parent.parent / "benchmark_results"
@@ -45,7 +54,7 @@ def build_masked_variants(seq_len: int, generator: torch.Generator):
         "dense": causal_mask(seq_len),
         "sliding_window": sliding_window_mask(seq_len, window_size=WINDOW_SIZE),
         "bigbird": bigbird_mask(
-            seq_len, window_size=WINDOW_SIZE, num_global=32, num_random=32, generator=generator
+            seq_len, window_size=WINDOW_SIZE, num_global=NUM_GLOBAL, num_random=NUM_RANDOM, generator=generator
         ),
     }
 
@@ -112,6 +121,36 @@ def run():
         )
         print(f"{'sliding_window_fast':15s} seq_len={seq_len:5d}  time={fast_elapsed*1000:8.2f} ms  (real kernel)")
 
+        # bigbird_fast: real kernel, but gathered via fancy indexing (a real
+        # copy) rather than unfold (a view) -- see module docstring. Report
+        # both the weights-only bytes (comparable to the other rows' numbers)
+        # and the actual K/V gather-copy bytes (the real dominant cost).
+        bb_generator = torch.Generator().manual_seed(0)
+        bb_elapsed = time_call(
+            lambda: bigbird_attention_fast(
+                q, k, v, window_size=WINDOW_SIZE, num_global=NUM_GLOBAL, num_random=NUM_RANDOM, generator=bb_generator
+            )
+        )
+        K = WINDOW_SIZE + NUM_GLOBAL + NUM_RANDOM
+        num_regular = seq_len - min(NUM_GLOBAL, seq_len)
+        bb_weights_bytes = BATCH * seq_len * K * BYTES_PER_ELEM
+        bb_gather_bytes = 2 * BATCH * num_regular * K * HEAD_DIM * BYTES_PER_ELEM  # k_gathered + v_gathered
+        rows.append(
+            {
+                "variant": "bigbird_fast",
+                "seq_len": seq_len,
+                "time_s": bb_elapsed,
+                "actual_bytes": bb_gather_bytes,
+                "sparse_equivalent_bytes": bb_weights_bytes,
+                "mask_density": K / seq_len,
+                "memory_kind": "actual",
+            }
+        )
+        print(
+            f"{'bigbird_fast':15s} seq_len={seq_len:5d}  time={bb_elapsed*1000:8.2f} ms  "
+            f"(real kernel, gather-copy={bb_gather_bytes/1e6:.2f} MB)"
+        )
+
     with open(OUT_DIR / "results.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
@@ -129,6 +168,7 @@ def plot_time(rows):
         "sliding_window": {},
         "bigbird": {},
         "sliding_window_fast": {"linewidth": 2.5},
+        "bigbird_fast": {"linewidth": 2.5, "linestyle": "-."},
     }
     for name, style in styles.items():
         xs = [r["seq_len"] for r in rows if r["variant"] == name]
@@ -153,18 +193,24 @@ def plot_memory(rows):
     ]
     ax.plot(xs, dense_mb, marker="o", linestyle="--", color="black", label="dense (actual, as-built)")
 
-    fast_mb = [
+    sw_fast_mb = [
         next(r for r in rows if r["variant"] == "sliding_window_fast" and r["seq_len"] == s)["actual_bytes"] / 1e6
         for s in xs
     ]
-    ax.plot(xs, fast_mb, marker="o", linewidth=2.5, label="sliding_window_fast (actual, real kernel)")
+    ax.plot(xs, sw_fast_mb, marker="o", linewidth=2.5, label="sliding_window_fast (actual, zero-copy unfold)")
+
+    bb_fast_mb = [
+        next(r for r in rows if r["variant"] == "bigbird_fast" and r["seq_len"] == s)["actual_bytes"] / 1e6
+        for s in xs
+    ]
+    ax.plot(xs, bb_fast_mb, marker="o", linewidth=2.5, linestyle="-.", label="bigbird_fast (actual, gather-copy K+V)")
 
     for name in ("sliding_window", "bigbird"):
         ys = [
             next(r for r in rows if r["variant"] == name and r["seq_len"] == s)["sparse_equivalent_bytes"] / 1e6
             for s in xs
         ]
-        ax.plot(xs, ys, marker="o", linestyle=":", label=f"{name} (theoretical, gather-based)")
+        ax.plot(xs, ys, marker="o", linestyle=":", label=f"{name} (theoretical, weights-only)")
 
     ax.set_xscale("log", base=2)
     ax.set_yscale("log")

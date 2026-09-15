@@ -25,17 +25,22 @@ pip install -r requirements.txt
   dense at seq_len=8192, measured, not estimated).
 - `sparse_attention/bigbird.py` — BigBird-style sparse attention: union of
   local (sliding-window) + global (fixed reachable-from-anywhere tokens) +
-  random (reproducible, causality-respecting) masks.
+  random (reproducible, causality-respecting) masks, both `bigbird_attention`
+  (masked correctness reference) and `bigbird_attention_fast` (real kernel —
+  global query rows via plain causal attention, regular rows via a
+  vectorized padded gather; ~2.7× faster than the reference at seq_len=8192,
+  but with a real, measured *memory regression* from its fancy-indexing
+  gather-copy — see WRITEUP.md section 4 for the honest numbers).
 - `tests/` — correctness harness: dense vs. PyTorch's own kernel, sliding
-  window and BigBird vs. dense at full coverage, the fast kernel vs. the
-  masked reference, mask/weight invariants, and NaN-handling edge cases
-  (29 tests, `pytest -q`).
+  window and BigBird vs. dense at full coverage, both fast kernels vs. their
+  masked references (exactly, where randomness isn't involved), mask/weight
+  invariants, and NaN-handling edge cases (35 tests, `pytest -q`).
 - `examples/walkthrough.py` — small worked numeric example (4 tokens)
   showing dense vs. sliding-window attention weights and outputs side by
   side; referenced directly in `WRITEUP.md`.
 - `scripts/benchmark.py` — wall-clock + memory benchmark across
-  seq_len 512→8192 for dense, sliding-window, BigBird (all reference
-  implementations) and sliding-window-fast (the real kernel); writes
+  seq_len 512→8192 for all five variants (three reference implementations
+  plus both real fast kernels); writes
   `benchmark_results/{results.csv,time.png,memory.png}`.
 - `sparse_attention/char_gpt.py` + `scripts/quality_eval.py` — tiny 2-layer
   char-level GPT trained on TinyShakespeare with each attention variant as
@@ -74,18 +79,21 @@ python scripts/quality_eval.py
 All six Task 1 checklist items implemented: manual dense attention,
 sliding-window sparse attention, BigBird-style local+global+random sparse
 attention, NaN-safe softmax, a wall-clock/memory benchmark (seq_len
-512→8192), and a char-GPT quality eval on TinyShakespeare — with a 29-test
+512→8192), and a char-GPT quality eval on TinyShakespeare — with a 35-test
 correctness harness for items 1-4 and saved, inspectable output
-(CSV + plots) for items 5-6. Beyond the checklist minimum: a real
-gather-based sliding-window kernel (`sliding_window_attention_fast`) that
-measures an actual ~97× speedup and ~128× memory reduction over dense at
-seq_len=8192, not just a theoretical one.
+(CSV + plots) for items 5-6. Beyond the checklist minimum: both sparse
+patterns got a real fast kernel, not just a masked reference —
+`sliding_window_attention_fast` (~97× faster, ~128× less memory than dense
+at seq_len=8192) and `bigbird_attention_fast` (~2.7× faster at seq_len=8192,
+but ~2× *more* memory than dense — a real, honestly-reported tradeoff from
+its gather-copy strategy, not a clean win).
 
 See `WRITEUP.md` for the full explanation: dense attention, both sparse
-patterns and the fast kernel, the NaN fix, why sliding-window attention
-loses information that BigBird's global tokens recover, the benchmark
-findings (real numbers for the fast kernel, theoretical for BigBird — and
-why BigBird's random component makes a fast kernel for it a harder
-problem), and the quality-eval result — sparse attention actually *matched
-or beat* dense at this small scale, and why that's a real, explainable
-finding rather than a contradiction of section 3's example.
+patterns and their fast kernels, the NaN fix, why sliding-window attention
+loses information that BigBird's global tokens recover, the full benchmark
+findings for all five variants (including why the BigBird kernel is faster
+but *not* smaller, and why that's the honest result rather than a
+disappointment to hide), and the quality-eval result — sparse attention
+actually *matched or beat* dense at this small scale, and why that's a
+real, explainable finding rather than a contradiction of section 3's
+example.
