@@ -1,10 +1,11 @@
 # Sparse Attention from Scratch — Writeup
 
 Postman AI/ML Recruitment Task, Task 1. This writeup covers what's implemented
-(manual dense attention, sliding-window sparse attention, and the correctness
-harness comparing both against reference), why sliding-window attention loses
-information relative to dense attention, and what's out of scope given the
-time available for this submission.
+(manual dense attention, sliding-window and BigBird-style sparse attention,
+NaN-safe softmax, and the correctness harness for all of it), why
+sliding-window attention loses information relative to dense attention and
+how BigBird's global/random components address that gap, and what's out of
+scope given the time available for this submission.
 
 ## 1. What's implemented
 
@@ -32,10 +33,43 @@ ground truth that a compute-efficient version would later be checked
 against. The mask being causal *and* windowed is enforced directly in
 `sliding_window_mask`, not bolted on afterward.
 
+**BigBird-style attention** (`sparse_attention/bigbird.py`) unions three
+mask components, then intersects with causality:
+
+- **local** — identical to the sliding-window mask above.
+- **global** — the first `num_global` positions are global tokens: they can
+  attend to their entire causal history, and every later position can
+  attend to them regardless of distance. This is the mechanism that fixes
+  the exact failure mode described in section 3 below.
+- **random** — for each query `i`, `num_random` keys are sampled uniformly
+  (via a `torch.Generator` for reproducibility) from `i`'s causally-valid
+  history (`0..i`). This gives the sparse graph a nonzero chance of
+  connecting any two positions instead of only ever the fixed local/global
+  set, which is the property BigBird's authors lean on for their
+  expressiveness guarantees.
+
+`bigbird_mask(seq_len, window_size, num_global, num_random, generator=None)`
+combines these as `(local | global | random) & causal`; `num_global=0,
+num_random=0` degenerates to exactly the sliding-window mask, which is
+tested directly (`test_mask_contains_local_window`).
+
+**NaN handling** (`sparse_attention/dense_attention.py`, `manual_softmax`):
+a fully-masked query row (every score `-inf`) previously computed
+`-inf - (-inf) = nan` when subtracting the row max for numerical stability,
+corrupting the whole row and propagating through `weights @ v`. The fix
+detects rows where the max is `-inf` and swaps their max to `0` before
+subtracting (so the row stays all `-inf`, `exp(-inf) = 0`), then guards the
+softmax denominator against `0/0` on those same rows. The net effect: a
+fully-masked query now produces an all-zero weight row and all-zero output,
+deterministically, instead of NaN. This matters in practice for BigBird-like
+patterns where a padding/masked position could otherwise end up with zero
+causally-valid keys.
+
 ## 2. Correctness harness
 
-11 tests across `tests/test_dense_attention.py` and
-`tests/test_sliding_window.py` (`pytest -q` → `11 passed`):
+23 tests across `tests/test_dense_attention.py`, `tests/test_sliding_window.py`,
+`tests/test_bigbird.py`, and `tests/test_nan_handling.py` (`pytest -q` →
+`23 passed`):
 
 - **Dense vs. PyTorch reference**: `dense_attention` is checked against
   `F.scaled_dot_product_attention`, both unmasked and with a causal mask,
@@ -54,6 +88,19 @@ against. The mask being causal *and* windowed is enforced directly in
   allowed set for position `i` is exactly `[i - window_size + 1, i]` clipped
   to `0`" are each checked directly, independent of any attention math.
 - **Weights are well-formed**: zero outside the window, sum to 1 inside it.
+- **BigBird mask properties**: never sees the future; degenerates to exactly
+  the sliding-window mask when global/random are both zero; a global token
+  is reachable from *every* later position even with `window_size=1` (i.e.
+  the only path to it is the global mechanism, not local overlap); the
+  random component is reproducible given the same `torch.Generator` seed and
+  never picks a causally-invalid key (row 0 can only ever pick itself, since
+  it has exactly one valid candidate).
+- **NaN handling**: a fully-masked softmax row is all-zero with no NaNs; a
+  *partially* masked row (some but not all entries `-inf`) is completely
+  unaffected and still sums to 1; `dense_attention` with a query that has
+  zero allowed keys produces zero output for that query and leaves every
+  other (normally-masked) row's softmax untouched, including a mix of
+  masked and unmasked queries in the same batch.
 
 Each test isolates one property rather than eyeballing end-to-end output,
 so a failure points at *what* broke (masking, softmax, windowing) rather
@@ -105,41 +152,47 @@ permanently, no matter how relevant it is, because the mask decides
 relevance by distance alone before the query/key similarity is ever
 computed.
 
-This is precisely the gap BigBird-style attention (local + global +
-random) is designed to close: a small set of **global tokens** are made
-visible to every query regardless of distance, so structurally important
-content (like token 1 in this example, if it happened to be a global
-token) survives the sparsification instead of being silently dropped. The
-**random** component exists for a different reason — it gives the
-attention graph a non-zero probability of connecting any two positions,
-which (per the BigBird paper's theoretical argument) helps the sparse
-pattern retain the expressive/theoretical properties of full attention
-(e.g., Turing-completeness) that a purely local+global pattern doesn't
-guarantee on its own.
+**BigBird's global tokens fix exactly this**, and it's checkable on the same
+4-token example, not just asserted: marking tokens 0 and 1 as global
+(`bigbird_mask(4, window_size=2, num_global=2, num_random=0)`) happens to
+make the union `local | global` cover every causally-valid pair in this tiny
+example, so the mask becomes identical to plain causal attention — and
+`bigbird_attention` reproduces the dense output for query 3 *exactly*:
+`weights = [0.065, 0.266, 0.131, 0.539]`, `output = [3.144, 31.440]`,
+matching dense to the last digit. Compare that to the sliding-window-only
+result two paragraphs up (`output = [3.804, 38.044]`): the only change is
+which mask bits are turned on, and token 1's dropped 0.266 of attention mass
+comes right back. That's the mechanism, not a coincidence of this example —
+in a real model, whichever tokens you designate global (in practice often
+fixed positions like `[BOS]`/`[CLS]`, or task-specific anchor tokens) stay
+reachable from arbitrarily far away, while ordinary tokens still only get
+the cheap local window plus a few random long-range connections.
+
+The **random** component in BigBird exists for a different reason than
+global tokens do: it gives the attention graph a non-zero probability of
+connecting any two positions at all, which (per the BigBird paper's
+theoretical argument) helps the sparse pattern retain expressive/
+theoretical properties of full attention (e.g. Turing-completeness) that a
+purely local+global pattern doesn't guarantee on its own. It's a
+different kind of guarantee than global tokens give — global tokens
+guarantee *specific* positions stay reachable; random edges guarantee the
+graph as a whole doesn't have blind spots baked into its structure.
 
 ## 4. Scope of this submission
 
 Implemented and tested: manual dense attention, sliding-window sparse
-attention, and a correctness harness for both (checklist items 1 and 2).
+attention, BigBird-style local+global+random sparse attention, and
+NaN-safe softmax — with a correctness harness covering all four
+(checklist items 1, 2, 3, and 4).
 
-Not implemented in this submission, due to time constraints: BigBird-style
-local+global+random block-sparse attention (item 3), NaN handling for
-fully-masked queries (item 4), the wall-clock/memory benchmark across
-seq_len 512→8192 (item 5), and the char-GPT quality eval on TinyShakespeare
+Not implemented in this submission, due to time constraints: the
+wall-clock/memory benchmark across seq_len 512→8192 (item 5), and the
+char-GPT quality eval on TinyShakespeare comparing dense vs. sparse loss
 (item 6).
 
-For item 4 specifically, the fix is straightforward given the existing
-code and worth stating even though it isn't implemented: a fully-masked
-query row has every score set to `-inf` before softmax, so
-`x - x.max(dim=-1)` becomes `-inf - (-inf)`, which is `nan`, and that NaN
-propagates through the whole row and then through `weights @ V`. The
-correct behavior is to detect rows where every entry is masked (`~mask`
-is all-`True` for that row) and force their output to zero (or to the
-row's own value via a residual, depending on the surrounding model) rather
-than let a fully-excluded query silently corrupt the batch with NaNs.
-
 The depth-over-completeness note in the task brief is why sections 1-3
-here go into the actual mechanism and a worked numeric example rather than
-listing checklist items; the two implemented patterns are correct
-(verified against PyTorch's own kernel) and the writeup demonstrates why
+here go into the actual mechanism and worked numeric examples rather than
+listing checklist items; the implemented patterns are correct
+(verified against PyTorch's own kernel, and against each other) and the
+writeup demonstrates why
 the sparsity pattern matters, not just that it runs.
