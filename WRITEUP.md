@@ -1,11 +1,12 @@
 # Sparse Attention from Scratch — Writeup
 
 Postman AI/ML Recruitment Task, Task 1. This writeup covers what's implemented
-(manual dense attention, sliding-window and BigBird-style sparse attention,
-NaN-safe softmax, and the correctness harness for all of it), why
-sliding-window attention loses information relative to dense attention and
-how BigBird's global/random components address that gap, and what's out of
-scope given the time available for this submission.
+(manual dense attention, sliding-window and BigBird-style sparse attention —
+plus a real compute-efficient sliding-window kernel, not just a masked
+reference — NaN-safe softmax, and the correctness harness for all of it),
+why sliding-window attention loses information relative to dense attention
+and how BigBird's global/random components address that gap, and the
+benchmark and quality-eval results for all six Task 1 checklist items.
 
 ## 1. What's implemented
 
@@ -28,10 +29,29 @@ while leaving the ratio — and therefore the softmax output — unchanged.
 `dense_attention` with a stricter mask: position `i` may attend only to
 itself and the previous `window_size - 1` positions. It is intentionally
 implemented as "dense attention + a smaller mask," not a gather-based
-kernel — the goal at this stage is a *correctness reference*, i.e., the
-ground truth that a compute-efficient version would later be checked
-against. The mask being causal *and* windowed is enforced directly in
-`sliding_window_mask`, not bolted on afterward.
+kernel — the point of this version is to be a *correctness reference*, the
+ground truth a compute-efficient version gets checked against. The mask
+being causal *and* windowed is enforced directly in `sliding_window_mask`,
+not bolted on afterward.
+
+**`sliding_window_attention_fast`** (same file) is that compute-efficient
+version: instead of forming the full `(seq_len, seq_len)` score matrix and
+masking most of it away, it pads K/V and uses `Tensor.unfold` to gather,
+for each query, only the `window_size` keys/values actually in its window
+— shape `(batch, seq_len, window_size, head_dim)` — then computes scores
+and output with `einsum` over that much smaller tensor. It reuses the same
+`manual_softmax` (so it's NaN-safe for the same reason section 1's dense
+attention is) but returns `weights` shaped `(batch, seq_len, window_size)`,
+not `(batch, seq_len, seq_len)` — slot `j` means key position
+`i - window_size + 1 + j`, not literal key index `j`, which the docstring
+calls out explicitly since it's an easy thing to get subtly wrong later.
+`tests/test_sliding_window_fast.py` checks it against
+`sliding_window_attention` (the masked reference) across typical shapes and
+edge cases (`window_size=1`, `seq_len=1`, `window_size >= seq_len`,
+`batch>1`) — output must match to `atol=1e-5` in every case, since the two
+are computing the same math through different paths. Section 4's benchmark
+is what this kernel is *for*: it's the one variant in this repo whose
+speed and memory numbers are real, not theoretical.
 
 **BigBird-style attention** (`sparse_attention/bigbird.py`) unions three
 mask components, then intersects with causality:
@@ -67,9 +87,9 @@ causally-valid keys.
 
 ## 2. Correctness harness
 
-23 tests across `tests/test_dense_attention.py`, `tests/test_sliding_window.py`,
-`tests/test_bigbird.py`, and `tests/test_nan_handling.py` (`pytest -q` →
-`23 passed`):
+29 tests across `tests/test_dense_attention.py`, `tests/test_sliding_window.py`,
+`tests/test_sliding_window_fast.py`, `tests/test_bigbird.py`, and
+`tests/test_nan_handling.py` (`pytest -q` → `29 passed`):
 
 - **Dense vs. PyTorch reference**: `dense_attention` is checked against
   `F.scaled_dot_product_attention`, both unmasked and with a causal mask,
@@ -88,6 +108,10 @@ causally-valid keys.
   allowed set for position `i` is exactly `[i - window_size + 1, i]` clipped
   to `0`" are each checked directly, independent of any attention math.
 - **Weights are well-formed**: zero outside the window, sum to 1 inside it.
+- **Fast kernel matches reference**: `sliding_window_attention_fast` output
+  matches `sliding_window_attention` to `atol=1e-5` across typical shapes,
+  `window_size=1`, `seq_len=1`, `window_size >= seq_len`, and `batch>1`;
+  its `(batch, seq_len, window_size)` weights sum to 1 with no NaNs.
 - **BigBird mask properties**: never sees the future; degenerates to exactly
   the sliding-window mask when global/random are both zero; a global token
   is reachable from *every* later position even with `window_size=1` (i.e.
@@ -181,43 +205,49 @@ graph as a whole doesn't have blind spots baked into its structure.
 ## 4. Benchmark: wall-clock and memory, seq_len 512 → 8192
 
 `scripts/benchmark.py` times a forward pass (min of 5 reps, one untimed
-warmup) and computes attention-matrix memory for dense, sliding-window
-(`window_size=64`), and BigBird (`window_size=64, num_global=32,
-num_random=32`) at `seq_len ∈ {512, 1024, 2048, 4096, 8192}`, `head_dim=64`.
-Raw numbers in `benchmark_results/results.csv`, plots in
+warmup) for four variants at `seq_len ∈ {512, 1024, 2048, 4096, 8192}`,
+`head_dim=64`: dense, sliding-window (masked reference, `window_size=64`),
+BigBird (`window_size=64, num_global=32, num_random=32`), and
+sliding-window-fast (the real gather-based kernel from section 1, same
+`window_size=64`). Raw numbers in `benchmark_results/results.csv`, plots in
 `benchmark_results/time.png` and `benchmark_results/memory.png`.
 
-**Wall-clock time is essentially identical across all three variants at
-every sequence length** (e.g. at `seq_len=8192`: dense 395ms, sliding-window
-392ms, BigBird 394ms) — the three lines in `time.png` overlap almost
-exactly, all growing quadratically with `seq_len`. This is not a bug, and
-it's the most important honest result of this benchmark: **every variant in
-this repo is built on `dense_attention`**, so every one of them computes the
-full `Q @ K^T` and materializes a full `(seq_len, seq_len)` weight matrix —
-the mask only decides which entries of that already-computed matrix get
-zeroed before the second matmul. Masking is a small constant-factor
-overhead on top of dense attention's cost, not a discount, because the
-expensive part (the full matmul) still happens either way. A sparsity
-pattern only saves time or memory once it's paired with a kernel that
-*skips* computing the masked-out entries instead of computing and then
-discarding them — e.g. a gather-based implementation that only ever forms
-`Q @ K_window^T` for the keys actually in a query's window/global/random
-set. That kernel is exactly what "reference implementation" in section 1
-was set up to eventually be checked against, and is the natural next step
-after this submission.
+**Dense, sliding-window, and BigBird are essentially identical in
+wall-clock time at every sequence length** (e.g. at `seq_len=8192`: dense
+338ms, sliding-window 372ms, BigBird 382ms) — those three lines in
+`time.png` overlap almost exactly, all growing quadratically with
+`seq_len`. This isn't a bug: **all three are built on `dense_attention`**,
+so all three compute the full `Q @ K^T` and materialize a full
+`(seq_len, seq_len)` weight matrix — the mask only decides which entries of
+that already-computed matrix get zeroed before the second matmul. Masking
+is a small constant-factor overhead on top of dense attention's cost, not
+a discount, because the expensive part (the full matmul) happens either
+way.
 
-**Memory tells the story sparsity is actually for.** `mask_density` (the
-fraction of the `seq_len × seq_len` grid each pattern keeps) drops sharply
-with `seq_len`: sliding-window goes from 11.7% density at `seq_len=512` to
-0.78% at `seq_len=8192`; BigBird from 20.1% to 1.53%. `memory.png` plots the
-*as-built* materialized memory (identical for all three variants, per the
-paragraph above, black dashed line) against the *theoretical* memory a
-gather-based kernel would need if it only ever stored the `mask_density`
-fraction of entries (colored lines). At `seq_len=8192` that's roughly a
-**128× reduction** for sliding-window and a **65× reduction** for BigBird
-versus the as-built dense matrix (2.09 MB and 4.11 MB respectively vs.
-268.44 MB) — the entire point of sparse attention, visible even though this
-repo's current implementations don't yet realize it.
+**`sliding_window_fast` is the one variant that actually skips the
+masked-out compute, and its numbers show it**: at `seq_len=8192` it runs in
+**3.49ms versus dense's 338ms — a real, measured ~97× speedup** — and the
+red line in `time.png` is visibly flat next to the other three's quadratic
+climb (its own cost is `O(seq_len · window_size)`, i.e. linear in
+`seq_len` at fixed `window_size`, not quadratic). Memory tells the matching
+story: at `seq_len=8192` its actual weights tensor is `(1, 8192, 64)` =
+**2.10 MB, a real ~128× reduction versus dense's 268.44 MB** — and it lands
+almost exactly on the "theoretical, gather-based" line already computed for
+plain sliding-window (`memory.png`), because that's precisely what this
+kernel does. This is the difference a real sparse kernel makes versus a
+reference implementation: identical *attention pattern*, wildly different
+*cost*, because cost comes from what you compute, not from what you
+mathematically define.
+
+BigBird doesn't get an equivalent fast kernel in this repo — its `nnz`
+pattern per query is local ∪ global ∪ random, which isn't a fixed
+contiguous offset the way a sliding window is, so it can't be gathered with
+a single `unfold`; a real kernel for it needs per-query variable-length
+gathering (or a block-sparse formulation), which is a meaningfully harder
+implementation than sliding-window's. `bigbird`'s time/memory numbers above
+stay reference-only (theoretical memory line in the plot) — the honest
+scope decision here was to make *one* pattern's speedup real and measured
+rather than leave every pattern's speedup theoretical.
 
 ## 5. Quality eval: char-GPT on TinyShakespeare
 
@@ -266,11 +296,16 @@ the kind of task section 3's worked example is designed to isolate.
 ## 6. Scope of this submission
 
 Implemented and tested: manual dense attention, sliding-window sparse
-attention, BigBird-style local+global+random sparse attention, NaN-safe
+attention (both a masked correctness reference and a real gather-based
+fast kernel), BigBird-style local+global+random sparse attention, NaN-safe
 softmax, the wall-clock/memory benchmark, and the char-GPT quality eval —
 covering every item in the Task 1 checklist (1 through 6), each backed by
-either a passing test suite (items 1-4) or a runnable script with saved,
-inspectable output (items 5-6).
+either a passing test suite (items 1-4, 29 tests) or a runnable script
+with saved, inspectable output (items 5-6). The fast kernel goes beyond
+the checklist's minimum ask — item 5 only asks to *benchmark* the
+patterns, not to make one of them actually fast — but it's what turns
+section 4's memory/speed story from a plausible theoretical argument into
+a measured one.
 
 The depth-over-completeness note in the task brief is why sections 1-3
 here go into the actual mechanism and worked numeric examples rather than
