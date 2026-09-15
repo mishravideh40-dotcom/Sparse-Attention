@@ -29,6 +29,9 @@ pip install -r requirements.txt
 - `examples/walkthrough.py` — small worked numeric example (4 tokens)
   showing dense vs. sliding-window attention weights and outputs side by
   side; referenced directly in `WRITEUP.md`.
+- `scripts/benchmark.py` — wall-clock + memory benchmark across
+  seq_len 512→8192 for all three attention variants; writes
+  `benchmark_results/{results.csv,time.png,memory.png}`.
 
 Run the tests:
 
@@ -42,17 +45,26 @@ Run the worked example:
 python -m examples.walkthrough
 ```
 
+Run the benchmark:
+
+```
+python scripts/benchmark.py
+```
+
 ## Status
 
 Implemented and tested: manual dense attention, sliding-window sparse
 attention, BigBird-style local+global+random sparse attention, NaN-safe
-softmax, and a correctness harness covering all of it (checklist items 1-4).
+softmax, and the wall-clock/memory benchmark — with a correctness harness
+covering items 1-4 (checklist items 1, 2, 3, 4, and 5).
 
-Not implemented (time-boxed submission): the wall-clock/memory benchmark
-across seq_len 512→8192 (item 5), and the char-GPT quality eval on
-TinyShakespeare (item 6). See `WRITEUP.md` section 4.
+Not implemented (time-boxed submission): the char-GPT quality eval on
+TinyShakespeare comparing dense vs. sparse loss (item 6). See `WRITEUP.md`
+section 5.
 
 See `WRITEUP.md` for the full explanation of dense attention, both sparse
-patterns, the NaN fix, and why sliding-window attention loses information
-that BigBird's global tokens recover — with real numbers from
-`examples/walkthrough.py`.
+patterns, the NaN fix, why sliding-window attention loses information that
+BigBird's global tokens recover, and the benchmark findings (including why
+wall-clock time doesn't yet improve, and why memory would with a proper
+sparse kernel) — with real numbers from `examples/walkthrough.py` and
+`benchmark_results/`.

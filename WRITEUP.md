@@ -178,17 +178,56 @@ different kind of guarantee than global tokens give — global tokens
 guarantee *specific* positions stay reachable; random edges guarantee the
 graph as a whole doesn't have blind spots baked into its structure.
 
-## 4. Scope of this submission
+## 4. Benchmark: wall-clock and memory, seq_len 512 → 8192
+
+`scripts/benchmark.py` times a forward pass (min of 5 reps, one untimed
+warmup) and computes attention-matrix memory for dense, sliding-window
+(`window_size=64`), and BigBird (`window_size=64, num_global=32,
+num_random=32`) at `seq_len ∈ {512, 1024, 2048, 4096, 8192}`, `head_dim=64`.
+Raw numbers in `benchmark_results/results.csv`, plots in
+`benchmark_results/time.png` and `benchmark_results/memory.png`.
+
+**Wall-clock time is essentially identical across all three variants at
+every sequence length** (e.g. at `seq_len=8192`: dense 395ms, sliding-window
+392ms, BigBird 394ms) — the three lines in `time.png` overlap almost
+exactly, all growing quadratically with `seq_len`. This is not a bug, and
+it's the most important honest result of this benchmark: **every variant in
+this repo is built on `dense_attention`**, so every one of them computes the
+full `Q @ K^T` and materializes a full `(seq_len, seq_len)` weight matrix —
+the mask only decides which entries of that already-computed matrix get
+zeroed before the second matmul. Masking is a small constant-factor
+overhead on top of dense attention's cost, not a discount, because the
+expensive part (the full matmul) still happens either way. A sparsity
+pattern only saves time or memory once it's paired with a kernel that
+*skips* computing the masked-out entries instead of computing and then
+discarding them — e.g. a gather-based implementation that only ever forms
+`Q @ K_window^T` for the keys actually in a query's window/global/random
+set. That kernel is exactly what "reference implementation" in section 1
+was set up to eventually be checked against, and is the natural next step
+after this submission.
+
+**Memory tells the story sparsity is actually for.** `mask_density` (the
+fraction of the `seq_len × seq_len` grid each pattern keeps) drops sharply
+with `seq_len`: sliding-window goes from 11.7% density at `seq_len=512` to
+0.78% at `seq_len=8192`; BigBird from 20.1% to 1.53%. `memory.png` plots the
+*as-built* materialized memory (identical for all three variants, per the
+paragraph above, black dashed line) against the *theoretical* memory a
+gather-based kernel would need if it only ever stored the `mask_density`
+fraction of entries (colored lines). At `seq_len=8192` that's roughly a
+**128× reduction** for sliding-window and a **65× reduction** for BigBird
+versus the as-built dense matrix (2.09 MB and 4.11 MB respectively vs.
+268.44 MB) — the entire point of sparse attention, visible even though this
+repo's current implementations don't yet realize it.
+
+## 5. Scope of this submission
 
 Implemented and tested: manual dense attention, sliding-window sparse
-attention, BigBird-style local+global+random sparse attention, and
-NaN-safe softmax — with a correctness harness covering all four
-(checklist items 1, 2, 3, and 4).
+attention, BigBird-style local+global+random sparse attention, NaN-safe
+softmax, and the wall-clock/memory benchmark above — with a correctness
+harness covering items 1-4 (checklist items 1, 2, 3, 4, and 5).
 
-Not implemented in this submission, due to time constraints: the
-wall-clock/memory benchmark across seq_len 512→8192 (item 5), and the
-char-GPT quality eval on TinyShakespeare comparing dense vs. sparse loss
-(item 6).
+Not implemented in this submission, due to time constraints: the char-GPT
+quality eval on TinyShakespeare comparing dense vs. sparse loss (item 6).
 
 The depth-over-completeness note in the task brief is why sections 1-3
 here go into the actual mechanism and worked numeric examples rather than
