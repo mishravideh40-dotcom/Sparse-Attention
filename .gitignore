@@ -5,4 +5,5 @@ __pycache__/
 *.png
 !benchmark_results/*.png
 !quality_eval_results/*.png
+!long_range_recall_results/*.png
 data/

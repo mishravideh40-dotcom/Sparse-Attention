@@ -48,6 +48,16 @@ pip install -r requirements.txt
 - `scripts/download_data.py` — fetches TinyShakespeare into
   `data/tinyshakespeare.txt` (gitignored; run this first for the quality
   eval).
+- `scripts/long_range_recall.py` — bonus experiment: a synthetic
+  "needle in a haystack" recall task (recall a digit seen 254 tokens ago)
+  that turns section 3's *theoretical* claim (sliding-window structurally
+  can't see far-back tokens; BigBird's global tokens can) into a *measured*
+  one — sliding-window and dense both stay at the random-guess baseline for
+  the full 2000-step run, BigBird reaches 99.9% recall accuracy. Writes
+  `long_range_recall_results/{results.csv,recall.png}`. See WRITEUP.md
+  section 6 for the full result, including the honest distinction between
+  sliding-window's failure (structural, provable from the mask) and dense
+  attention's failure (an optimization gap, not a capacity limit).
 
 Run the tests:
 

@@ -380,7 +380,86 @@ more steps, or a task with real long-range dependencies (e.g. needing to
 recall a character name introduced many lines earlier) — which is exactly
 the kind of task section 3's worked example is designed to isolate.
 
-## 6. Scope of this submission
+## 6. Long-range recall: validating section 3 with a real experiment
+
+Section 3's claim — sliding-window attention *structurally* cannot use a
+distant-but-relevant token, no matter how relevant it is — was demonstrated
+above on a 4-token toy example. `scripts/long_range_recall.py` checks the
+same claim on something a model actually has to learn, not just a
+hand-computed forward pass.
+
+**Task ("needle in a haystack")**: each training sequence is
+`KEY <253 random filler digits> ? KEY` — 256 tokens total. The digit at
+position 0 (`KEY`) must be reproduced right after the `?` marker, 254
+positions later. Every filler digit is i.i.d. random, so it carries no
+signal; the *only* way to beat random guessing (10 digits → chance accuracy
+10%, chance loss `ln(10) ≈ 2.303`) at the query position is to actually
+recall position 0, however far back it is. `window_size=8` is set far
+smaller than the 253-token gap, so sliding-window attention is *provably*
+unable to ever see position 0 from the query position — that's a fact about
+the mask, checkable without running anything. BigBird's global tokens
+(`num_global=4`, which includes position 0) make position 0 reachable from
+every position regardless of distance — the exact mechanism section 3
+describes. Three otherwise-identical tiny models (2 layers, embed dim 64,
+same init, same 2000-step training run, same batch order) are trained, one
+per attention kind, and evaluated on loss/accuracy at the query position
+only. Results in `long_range_recall_results/{results.csv,recall.png}`.
+
+**Results at step 2000**:
+
+| variant         | recall loss | recall accuracy |
+|------------------|------------:|-----------------:|
+| dense            | 2.303       | 9.1%             |
+| sliding-window   | 2.303       | 9.5%             |
+| BigBird          | 0.022       | 99.9%            |
+| random-guess     | 2.303       | 10.0%            |
+
+BigBird goes from chance to essentially perfect recall (loss drops off a
+cliff between step 400 and step 900, then keeps improving to 99.9%/100%
+accuracy by step 1600–2000). Sliding-window never moves off the
+random-guess baseline for the entire run — exactly as predicted, since it's
+mathematically impossible for it to do otherwise with `window_size=8` and a
+253-token gap.
+
+**The one result here that needs an honest, careful read, not a
+convenient one: dense attention also never moves off the random-guess
+baseline.** This is *not* the same failure as sliding-window's. Nothing in
+dense attention's mask forbids attending to position 0 — every query can
+see the entire causal history, position 0 included, so the *representational
+capacity* to solve this task is there from step 0. What section 3 shows is
+a structural/architectural claim (can the pattern even represent the
+solution), and sliding-window fails it. What this experiment additionally
+shows is an *optimization* claim (does a small model, in a fixed training
+budget, actually find that solution via gradient descent), and plain dense
+attention fails *that*, in this setup. With 254 keys per query that are
+almost entirely i.i.d. noise, "attend strongly to position 0 specifically"
+is a single, sharp, hard-to-discover point in a large, mostly-flat
+optimization landscape — nothing in the loss surface at initialization
+hints that position 0 is special, since the query has to learn a Q/K
+direction that aligns *only* with position 0's key out of 254 candidates
+with no other cue. BigBird's global mechanism sidesteps that search
+entirely: position 0 being unconditionally in every query's attention set
+is a fact about the architecture, not something the model has to discover,
+so the much easier remaining problem ("given that you can already see
+position 0, learn to copy it") is what actually gets learned, and it
+converges fast once the model starts using that shortcut (the sharp
+loss/accuracy transition between step 400–900 in `recall.png` is visible
+learning of *that*, not of "how to search 254 positions").
+
+So the honest conclusion is two-layered, not one: sliding-window's failure
+here is a **hard architectural ceiling** (provable from the mask, true at
+any training budget, any model size); dense attention's failure is a
+**soft optimization gap** (this specific tiny single-head model, this
+training budget, this task's needle-to-noise ratio — a bigger model, more
+steps, or a warm-start could plausibly close it, whereas no amount of
+either closes sliding-window's gap). BigBird's global-token mechanism helps
+with *both* problems at once, which is arguably the more complete point:
+it doesn't just make long-range recall theoretically possible the way
+plain dense attention already does — it makes it *findable* by gradient
+descent, by removing the search problem instead of merely permitting a
+solution to exist.
+
+## 7. Scope of this submission
 
 Implemented and tested: manual dense attention, sliding-window sparse
 attention (masked reference + a real zero-copy fast kernel), BigBird-style
